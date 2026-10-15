@@ -1,0 +1,174 @@
+//#############################################################################
+// contract.lib -- shared conventions for all drone engines.
+// Usage: ct = library("contract.lib");
+//
+//  * Tuning   : root (Hz) + 2D JI lattice, ratio(i,j) = genX^i * genY^j,
+//               octave-reduced to [1,2). Same UI paths in every engine, so a
+//               host can broadcast one tuning to all engines.
+//  * Mod bus  : engines take NMOD audio-rate inputs, normalised to [-1, 1].
+//               The bus is produced outside the engine (periods s..min).
+//  * Scenes   : interpolated by the host; every parameter here is click-free
+//               under arbitrary (incl. stepped) changes.
+//  * Output   : stereo, level -> DC block -> lookahead limiter -> soft knee.
+//  * RNG      : counter-based hash of (seed, voice, tick): reproducible and
+//               identical across sample rates (tick is defined in seconds).
+//#############################################################################
+
+declare name "contract";
+declare version "0.1";
+
+import("stdfaust.lib");
+
+NMOD = 4;
+
+//---------------------------------- math ------------------------------------
+LN2 = 0.6931471805599453;
+exp2(x) = exp(x * LN2);
+
+// 2^(c/1200) for |c| <~ 150 cent, 2nd-order Taylor: error < 0.2 cent.
+centsToRatio(c) = 1.0 + y * (1.0 + 0.5 * y) with { y = c * (LN2 / 1200.0); };
+
+// sin(2*pi*ph), ph in [0, 1). Quarter-wave fold + odd Taylor to t^9:
+// max abs error 3.6e-6 (-109 dB), ~12 flops, no libm call.
+sin2pi(ph) = 0.0 - t * (1.0 - t2 * (1.0 / 6.0) * (1.0 - t2 * (1.0 / 20.0)
+           * (1.0 - t2 * (1.0 / 42.0) * (1.0 - t2 * (1.0 / 72.0)))))
+with {
+    x  = ph - 0.5;
+    xq = select2(x > 0.25, select2(x < -0.25, x, -0.5 - x), 0.5 - x);
+    t  = 2.0 * ma.PI * xq;
+    t2 = t * t;
+};
+
+// Phase accumulator in cycles, [0, 1). inc must be in [0, 1).
+wrap1(y) = y - float(y >= 1.0);
+phasor(inc) = (+(inc) : wrap1) ~ _;
+
+//------------------------------ smoothing -----------------------------------
+isFirst = ba.time == 0;
+
+// One-pole lag, tau in seconds. Starts at x (no startup glide).
+lag(tau, x) = loop ~ _
+with {
+    p = ba.tau2pole(max(tau, 0.0001));
+    loop(y) = select2(isFirst, x + p * (y - x), x);
+};
+
+//------------------------------ seeded RNG ----------------------------------
+// 32-bit integer hash (xorshift-multiply). Shifts are masked so the result
+// does not depend on signed right-shift semantics.
+mix(x) = x xor ((x >> 16) & 65535);
+hash(x) = int(x) : mix : *(73244475) : mix : *(73244475) : mix;
+ulo(h) = float(h & 65535) / 32767.5 - 1.0;           // uniform [-1, 1]
+uhi(h) = float((h >> 16) & 65535) / 32767.5 - 1.0;   // independent of ulo
+
+//--------------------------- control-rate clock -----------------------------
+TICK = 0.05;                                          // s
+tickLen = max(1, int(TICK * ma.SR + 0.5));            // samples
+tickPhase = (+(1) : %(tickLen)) ~ _;
+tickEdge = tickPhase == 0;
+tickIdx = +(tickEdge) ~ _;                            // int, wraps after ~3 yr
+tickDt = float(tickLen) / ma.SR;
+
+// Ornstein-Uhlenbeck walk, unit stationary variance, correlation time tau (s).
+// xi: zero-mean unit-variance innovation, sampled on tick edges only.
+// tau may change at any time without a discontinuity. The tick staircase is
+// removed by a 2-pole lag (tau = TICK/2 each), otherwise it is audible as
+// 20 Hz zipper noise when the walk drives amplitude.
+ou(tau, xi) = loop ~ _ : si.smooth(p) : si.smooth(p)
+with {
+    a = exp(0.0 - tickDt / max(tau, tickDt));
+    b = sqrt(1.0 - a * a);
+    p = ba.tau2pole(0.5 * TICK);
+    loop(x) = select2(tickEdge, x, a * x + b * xi);
+};
+
+//-------------------------------- tuning ------------------------------------
+tg(x) = hgroup("[0]tuning", x);
+root  = tg(hslider("[0]root [unit:Hz] [scale:log]", 55, 20, 880, 0.01));
+genX  = tg(nentry("[1]genX", 3, 2, 13, 1));
+genY  = tg(nentry("[2]genY", 5, 2, 13, 1));
+offX  = tg(nentry("[3]offX", 0, -6, 6, 1));
+offY  = tg(nentry("[4]offY", 0, -6, 6, 1));
+glide = tg(hslider("[5]glide [unit:s] [scale:log]", 8, 0.05, 120, 0.01));
+
+lroot = ma.log2(root) : lag(glide);
+
+// log2 of the octave-reduced lattice ratio at integer coords (i, j).
+lratio(i, j) = e - floor(e)
+with {
+    e = float(i) * ma.log2(genX) + float(j) * ma.log2(genY);
+};
+
+// Tenney-style harmonic distance without the factor 2 (octaves are free).
+hdist(i, j) = abs(i) * ma.log2(genX) + abs(j) * ma.log2(genY);
+
+//----------------------------- lattice window -------------------------------
+// gw x gh window of lattice nodes, node n = x + gw * y, centred on (offX, offY).
+winX(gw, n) = n % gw;
+winY(gw, n) = int(n / gw);
+winI(gw, n) = winX(gw, n) - int((gw - 1) / 2) + offX;
+winJ(gw, gh, n) = winY(gw, n) - int((gh - 1) / 2) + offY;
+
+// Node weight: gaussian around focus (fx, fy in window coords, radius r)
+// times a harmonic-distance prior 2^(-pur * hdist).
+winWeight(gw, gh, n, fx, fy, r, pur) = g * th
+with {
+    dx = float(winX(gw, n)) - fx;
+    dy = float(winY(gw, n)) - fy;
+    g  = exp(-0.5 * (dx * dx + dy * dy) / (r * r));
+    th = exp2(0.0 - pur * hdist(winI(gw, n), winJ(gw, gh, n)));
+};
+
+// 1 inside [20 Hz, 0.42 SR], linear fades to 0 at 10 Hz and 0.48 SR.
+bandGate(f) = lo * hi
+with {
+    lo = min(1.0, max(0.0, (f - 10.0) / 10.0));
+    hi = min(1.0, max(0.0, (0.48 * ma.SR - f) / (0.06 * ma.SR)));
+};
+
+//------------------------------ resonators ----------------------------------
+// tan(pi * x) for x in [0, 0.49]; relative accuracy is good near 0 as well.
+tanpi(x) = sin2pi(0.5 * x) / sin2pi(0.5 * x + 0.25);
+
+// TPT state-variable filter (Zavalishin), band-pass output.
+// g = tan(pi f / SR), k = 1 / Q. Stable under per-sample modulation of g, k.
+// k * svfbp(g, k) has unity gain at the centre frequency.
+svfbp(g, k) = core ~ (_, _) : (!, !, _)
+with {
+    core(ic1, ic2, x) = 2.0 * v1 - ic1, 2.0 * v2 - ic2, v1
+    with {
+        a1 = 1.0 / (1.0 + g * (g + k));
+        a2 = g * a1;
+        a3 = g * a2;
+        v3 = x - ic2;
+        v1 = a1 * ic1 + a2 * v3;
+        v2 = ic2 + a2 * ic1 + a3 * v3;
+    };
+};
+
+// Seeded white noise, uniform, unit variance. Per-sample, so (unlike the
+// tick-based walks) the sequence depends on the sample rate.
+noise(key) = ulo(hash(key + ba.time * 668265263)) * sqrt(3.0);
+
+//-------------------------------- output ------------------------------------
+og(x) = hgroup("[9]output", x);
+level = og(hslider("[0]level [unit:dB]", -12, -60, 0, 0.1))
+      : ba.db2linear : si.smooth(ba.tau2pole(0.5));   // from 0: 0.5 s fade-in
+
+CEIL = 0.891;                                         // -1 dBFS
+
+dcblock(fc) = _ <: _, mem : - : + ~ *(p)
+with {
+    p = exp(0.0 - 2.0 * ma.PI * fc / ma.SR);
+};
+
+// Identity below k, tanh knee above; |out| < 1.
+softclip(k, x) = select2(ax > k, x, sg * (k + (1.0 - k) * ma.tanh((ax - k) / (1.0 - k))))
+with {
+    ax = abs(x);
+    sg = select2(x < 0, 1.0, -1.0);
+};
+
+outStage = par(i, 2, *(level) : dcblock(5.0))
+         : co.limiter_lad_stereo(0.01, CEIL, 0.002, 0.03, 0.5)
+         : par(i, 2, softclip(0.95));
